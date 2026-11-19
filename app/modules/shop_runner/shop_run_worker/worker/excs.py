@@ -1,0 +1,2 @@
+class ShopNotFoundInRedisQueueError(Exception):
+    pass

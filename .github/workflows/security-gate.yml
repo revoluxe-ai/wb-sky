@@ -1,0 +1,113 @@
+name: OSS security gate
+
+on:
+  pull_request:
+    branches: [stage, master]
+  push:
+    branches: [stage, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install pinned Gitleaks with checksum verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=8.30.1
+          base="https://github.com/gitleaks/gitleaks/releases/download/v8.30.1"
+          dir="$(mktemp -d)"
+          cd "$dir"
+          curl -fLsS --retry 3 -o "gitleaks_8.30.1_linux_x64.tar.gz" "$base/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl -fLsS --retry 3 -o "checksums.txt" "$base/gitleaks_8.30.1_checksums.txt"
+          grep 'gitleaks_8.30.1_linux_x64.tar.gz' checksums.txt | sha256sum --check --status
+          tar -xzf "gitleaks_8.30.1_linux_x64.tar.gz" gitleaks
+          install -m 0755 gitleaks "$RUNNER_TEMP/gitleaks"
+      - name: Scan current file tree and Git history
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          "$RUNNER_TEMP/gitleaks" dir . --no-banner --redact=100 \
+            --report-format json --report-path "$RUNNER_TEMP/current.json" \
+            --exit-code=2 > "$RUNNER_TEMP/gitleaks-dir.log" 2>&1
+          dir_rc=$?
+          "$RUNNER_TEMP/gitleaks" git . --no-banner --redact=100 \
+            --report-format json --report-path "$RUNNER_TEMP/history.json" \
+            --exit-code=2 > "$RUNNER_TEMP/gitleaks-git.log" 2>&1
+          history_rc=$?
+          set -e
+          python - "$dir_rc" "$history_rc" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          codes = (int(sys.argv[1]), int(sys.argv[2]))
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          for label, filename in (("current", "current.json"), ("history", "history.json")):
+              path = temp / filename
+              try:
+                  findings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+              except (json.JSONDecodeError, OSError):
+                  findings = []
+              if not isinstance(findings, list):
+                  raise SystemExit("invalid gitleaks report format")
+              index = 0 if label == "current" else 1
+              print(f"{label}: {len(findings)} potential leaks; exit_code={codes[index]}")
+              for f in findings[:100]:
+                  # Do not print Match, Secret, raw source or report files.
+                  print(f"::warning file={f.get('File', '')},line={f.get('StartLine', 1)}::{f.get('RuleID', 'secret')} (redacted)")
+          if any(code != 0 for code in codes):
+              raise SystemExit("security scan failed: inspect sanitized file/line findings; do not publish")
+          PY
+      - name: Check forbidden tracked artifact types
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+
+          names = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          offenders = []
+          for name in names:
+              if not name:
+                  continue
+              p = pathlib.PurePosixPath(name)
+              if p.suffix.lower() in {".pem", ".p12", ".pfx", ".key", ".sqlite", ".db"}:
+                  offenders.append(name)
+              if name in {".env", ".env.production", ".env.stage"}:
+                  offenders.append(name)
+          if offenders:
+              for path in offenders[:100]:
+                  print("::error file=" + path + "::Forbidden tracked artifact")
+              raise SystemExit("forbidden artifact detected")
+          print("No forbidden tracked artifact types")
+          PY
+
+  source-parse:
+    name: python-syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile tracked Python files without importing runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-files -z -- '*.py' | xargs -0 -r -n 100 python -m py_compile

@@ -1,0 +1,55 @@
+services:
+  test_db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: test_adv_bot_db
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+    volumes:
+      - .\tests\postgres-init:/docker-entrypoint-initdb.d # добавляем init-скрипты для pg_hba.conf
+    ports:
+      - "5433:5432" # Используем другой порт, чтобы избежать конфликтов с основной БД
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_adv_bot_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Для тестов не сохраняем данные постоянно, чтобы каждый раз была чистая база
+    # volumes:
+    #   - ./pg_data_test:/var/lib/postgresql/data
+
+
+  test_clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_DB: test_adv_bot_clickhouse
+      CLICKHOUSE_USER: CLICK_HOUSE_USER
+      CLICKHOUSE_PASSWORD: password
+      TZ: Europe/Moscow
+    ports:
+      - "8124:8123"  # HTTP порт
+      - "9001:9000"  # Native протокол
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Для тестов не сохраняем данные постоянно
+    # volumes:
+    #   - ./ch_data_test:/var/lib/clickhouse
+    volumes:
+      - .\tests\clickhouse-config:/etc/clickhouse-server/users.d/
+
+
+  # test_redis: host :6379 for /opsx-test-env v0.1 probe + env.sample REDIS_PORT
+  test_redis:
+    image: redis:7-alpine
+    container_name: tests-test_redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 20

@@ -1,0 +1,189 @@
+name: Migration gates
+
+on:
+  pull_request:
+    paths:
+      - "alembic_/**"
+      - "alembic.ini"
+      - "app/db/**"
+      - "app/modules/ad_control_settings/**"
+      - "tests/migrations/**"
+      - "tests/ad_control_persistence_live/**"
+      - "tests/integration/ad_control_settings/**"
+      - ".github/workflows/migration-gates.yml"
+      - ".github/ci/migration-ephemeral.env"
+      - "k8s/jobs/**"
+      - "k8s/migrations/**"
+      - "scripts/Invoke-ProdDbMigrateThenRollout.ps1"
+
+jobs:
+  migration-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+      - name: Install deps
+        run: poetry install --no-interaction --no-ansi
+      - name: Alembic single head
+        run: |
+          poetry run alembic heads
+          test "$(poetry run alembic heads | wc -l)" -eq 1
+      - name: Pytest migrations unit
+        run: poetry run pytest tests/migrations -q
+
+  migration-ephemeral-pg:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: replay
+          POSTGRES_USER: replay
+          POSTGRES_DB: replay_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+      - name: Install deps
+        run: poetry install --no-interaction --no-ansi
+      - name: Expand head + BASE detection on ephemeral PG
+        env:
+          DATABASE_URL: postgresql://replay:replay@localhost:5432/replay_db
+          POSTGRES_PORT: "5432"
+          POSTGRES_DBNAME: replay_db
+          POSTGRES_USER: replay
+          POSTGRES_PASSWORD: replay
+          POSTGRES_MASTER_HOST: localhost
+          POSTGRES_REPLICA_HOST: localhost
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          source .github/ci/migration-ephemeral.env
+          set +a
+          BASELINE_REV=8c541a39b7e2
+          HEAD=$(poetry run python - <<'PY'
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          script = ScriptDirectory.from_config(Config("alembic.ini"))
+          heads = script.get_heads()
+          if len(heads) != 1:
+              raise SystemExit(f"expected exactly one repository head, got {heads}")
+          head = heads[0]
+
+          def closure_down(revision_id: str) -> set[str]:
+              """All revisions reachable from revision_id following down_revision."""
+              rev = script.get_revision(revision_id)
+              result = {rev.revision}
+              down = rev.down_revision
+              if down is None:
+                  return result
+              if isinstance(down, tuple):
+                  for parent in down:
+                      result |= closure_down(parent)
+              else:
+                  result |= closure_down(down)
+              return result
+
+          ancestors = closure_down(head)
+          required = {"8c541a39b7e2", "e8f9a0b1c2d3"}
+          missing = required - ancestors
+          if missing:
+              raise SystemExit(
+                  f"fixture topology invalid for HEAD {head}: "
+                  f"missing ancestor revisions {sorted(missing)}"
+              )
+          print(head)
+          PY
+          )
+          echo "fixture topology ok: HEAD=$HEAD ancestors include $BASELINE_REV and e8f9a0b1c2d3"
+          # Full historical upgrade-from-empty is not CI-safe (legacy out-of-order
+          # revisions). Gate the release Expand path: stub table → stamp baseline → head.
+          poetry run python - <<'PY'
+          from sqlalchemy import create_engine
+          from app.db.migration_ephemeral_baseline import apply_ephemeral_baseline_stubs
+
+          url = "postgresql://replay:replay@localhost:5432/replay_db"
+          eng = create_engine(url)
+          apply_ephemeral_baseline_stubs(eng)
+          eng.dispose()
+          print("ephemeral baseline stubs ok")
+          PY
+          echo "stamp $BASELINE_REV then upgrade to $HEAD"
+          poetry run alembic stamp "$BASELINE_REV"
+          poetry run alembic upgrade "$HEAD"
+          # Do NOT run `alembic check` here: stub schema ≠ full models (expected drift).
+          test "$(poetry run alembic current | awk '{print $1}')" = "$HEAD"
+          poetry run python - <<'PY'
+          from sqlalchemy import create_engine
+          from app.db.migration_ephemeral_baseline import assert_ad_control_tables_present
+
+          eng = create_engine("postgresql://replay:replay@localhost:5432/replay_db")
+          assert_ad_control_tables_present(eng)
+          eng.dispose()
+          print("ad control migration tables ok")
+          PY
+          # Baseline 8c541 skips f2a3 Expand DDL on advsetting; upgrade applies e8f9 shelf SoT.
+          poetry run python - <<'PY'
+          from sqlalchemy import create_engine, text
+          eng = create_engine("postgresql://replay:replay@localhost:5432/replay_db")
+          with eng.connect() as conn:
+              settings_rows = conn.execute(
+                  text(
+                      "SELECT column_name FROM information_schema.columns "
+                      "WHERE table_name='auto_shelf_bid_control_settings' "
+                      "AND column_name IN ('retest_interval_days')"
+                  )
+              ).fetchall()
+              settings_cols = {r[0] for r in settings_rows}
+              assert settings_cols == {"retest_interval_days"}, settings_cols
+              state_rows = conn.execute(
+                  text(
+                      "SELECT column_name FROM information_schema.columns "
+                      "WHERE table_name='auto_shelf_bid_control_state' "
+                      "AND column_name IN ('shelf_exhausted_pause_active')"
+                  )
+              ).fetchall()
+              state_cols = {r[0] for r in state_rows}
+              assert state_cols == {"shelf_exhausted_pause_active"}, state_cols
+              print(
+                  "e8f9 shelf-exhausted columns ok",
+                  sorted(settings_cols | state_cols),
+              )
+          eng.dispose()
+          PY
+          MIGRATION_EPHEMERAL_PG_URL="postgresql://replay:replay@localhost:5432/replay_db" \
+            poetry run pytest tests/migrations/test_ephemeral_expand_upgrade.py -q
+          AD_CONTROL_PERSISTENCE_PG_URL="postgresql://replay:replay@localhost:5432/replay_db" \
+            poetry run pytest tests/ad_control_persistence_live \
+              --confcutdir=tests/ad_control_persistence_live -q
+          # Missing alembic_version ⇒ BASE (42P01 only)
+          poetry run python - <<'PY'
+          from sqlalchemy import create_engine, text
+          from app.db.migrate import _db_heads
+          eng = create_engine("postgresql://replay:replay@localhost:5432/replay_db")
+          with eng.begin() as conn:
+              conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+          with eng.connect() as conn:
+              assert _db_heads(conn) == frozenset({"BASE"}), _db_heads(conn)
+              print("BASE detection ok")
+          eng.dispose()
+          PY

@@ -1,0 +1,34 @@
+name: Branch flow
+on:
+  pull_request:
+    branches: [master, stage]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+permissions: {}
+jobs:
+  branch-flow:
+    name: branch-flow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce branch promotion policy
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE" == 'master' ]]; then
+            if [[ "$HEAD" == 'stage' && "$HEAD_REPO" == "$BASE_REPO" ]]; then
+              echo 'Allowed: stage -> master'
+              exit 0
+            fi
+            echo 'Only a PR from this repository stage branch can target master' >&2
+            exit 1
+          fi
+          if [[ "$BASE" == 'stage' && "$HEAD" != 'stage' && "$HEAD" != 'master' ]]; then
+            echo 'Allowed: feature branch -> stage'
+            exit 0
+          fi
+          echo 'Only feature-branch PRs may target stage' >&2
+          exit 1

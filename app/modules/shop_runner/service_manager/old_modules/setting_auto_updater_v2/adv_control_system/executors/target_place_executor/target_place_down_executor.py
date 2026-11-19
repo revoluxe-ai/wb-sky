@@ -1,0 +1,135 @@
+"""Исполнитель для понижения целевой позиции (увеличение номера позиции)."""
+
+import logging
+import math
+
+from typing_extensions import override
+
+from sqlalchemy import update
+
+from app.modules.common_slaves.wildberries.models.enums import TargetPositionMode
+from app.modules.common_slaves.wildberries.models.models import AdvSetting
+from app.modules.shop_runner.service_manager.old_modules.setting_auto_updater_v2.adv_control_system.data_classes.data_classes import (
+    ExecutionResult,
+    PipelineContext,
+)
+from app.modules.shop_runner.service_manager.old_modules.setting_auto_updater_v2.adv_control_system.executors.base_executor import (
+    BaseExecutor,
+)
+from app.modules.wb_adv_updater.calculated_keywords_manager.dto.states import KeywordStatus
+
+from .redis_cache import LastTargetPlaceDownV2
+
+logger = logging.getLogger(__name__)
+
+
+class TargetPlaceDownExecutor(BaseExecutor):
+    """Понижает целевую позицию на 1 (увеличивает номер, снижает охват)."""
+
+    PASS_TIME_SECONDS: int = 15 * 60  # 15 минут между изменениями
+    MAX_PLACE: int = 1  # Максимальное повышение
+    MIN_PLACE: int = 300  # Минимальное понижение
+
+    # TODO: Если Текущая позиция больше или равна той, на которую хотим понизить, то не понижаем, смысла нет
+    @override
+    async def execute(self, ctx: PipelineContext) -> ExecutionResult:
+        """Понижает целевую позицию (increase number).
+
+        Args:
+            ctx: Контекст выполнения
+
+        Returns:
+            ExecutionResult с результатом операции
+        """
+
+        complex_adv = ctx.complex_adv
+        if complex_adv.individual_keywords_target_place_mode:
+            result = await self._set_min_cpa_mode(ctx)
+            return result
+
+        adv_setting: AdvSetting = complex_adv.adv_setting
+        adv_id = adv_setting.adv_id
+        if not ctx.complex_adv.is_target_position_control_enabled:
+            logger.debug(
+                "[adv_id=%s] TargetPlaceDown: управление целевой позицией выключено, пропускаем",
+                adv_id,
+            )
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+        min_place_by_keywords: int | None = await self._get_min_place_by_keywords(ctx)
+        if not min_place_by_keywords:
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+        redis_cache = LastTargetPlaceDownV2(ctx.complex_adv.adv_setting)
+        # Проверка rate-limiting
+        if not await redis_cache.check_pass_time(self.PASS_TIME_SECONDS):
+            logger.debug("[adv_id=%s] TargetPlaceDown: rate-limit не прошёл", adv_id)
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+
+        current_target_place: int = ctx.complex_adv.target_place
+
+        if not current_target_place:
+            logger.debug(
+                "[adv_id=%s] TargetPlaceDown: целевая позиция не установлена", adv_id
+            )
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+
+        # Проверка лимита
+        if current_target_place >= self.MIN_PLACE:  # нижнее место, большое число
+            logger.debug(
+                "[%s] TargetPlaceDown: достигнут минимум (current=%s, max=%s)",
+                adv_id,
+                current_target_place,
+                self.MIN_PLACE,
+            )
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+
+        # Понижаем позицию на 1 (увеличиваем номер)
+        new_place = min(
+            current_target_place + 1, self.MIN_PLACE, min_place_by_keywords
+        )
+
+        if new_place == current_target_place:
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+
+        # Обновляем в БД
+        stmt = (
+            update(AdvSetting)
+            .where(AdvSetting.id == ctx.complex_adv.db_id)
+            .values({"max_place": new_place})
+        )
+        _ = await ctx.session.execute(stmt)
+        await ctx.session.commit()
+        await redis_cache.set()
+
+        logger.info(
+            "[adv_id=%s] TargetPlaceDown: %s -> %s",
+            adv_id,
+            current_target_place,
+            new_place,
+        )
+        if new_place < current_target_place:
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+        # Efficiency = 1 (выполнили одно изменение на 1)
+        # TODO: Тут надо переделать логику и включить возможность отрицательного efficiency, например, когда появились новые ограничения и нужно сделать противоположние задаче экзекутера действия
+        return ExecutionResult(success=True, efficiency=1.0, used_power=1)
+
+    @staticmethod
+    async def _get_min_place_by_keywords(ctx: PipelineContext) -> int | None:
+        keywords = await ctx.complex_adv.get_keywords()
+        active_keywords = [kw for kw in keywords if kw.status == KeywordStatus.GOOD]
+        if not active_keywords:
+            return None
+        min_place = max([kw.position for kw in active_keywords])
+        return math.floor(min_place + 0.5)
+
+    @staticmethod
+    async def _set_min_cpa_mode(ctx: PipelineContext) -> ExecutionResult:
+        if ctx.complex_adv.target_position_mode ==  TargetPositionMode.MIN_CPA:
+            return ExecutionResult(success=False, efficiency=0.0, used_power=0)
+        stmt = update(AdvSetting).where(AdvSetting.id == ctx.complex_adv.adv_setting_original_id)\
+        .values({'target_position_mode': TargetPositionMode.MIN_CPA})
+        await ctx.session.execute(stmt)
+        await ctx.session.commit()
+        return ExecutionResult(success=True, efficiency=1.0, used_power=1)
+
+
+

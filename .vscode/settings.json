@@ -1,0 +1,38 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\vkita\\AppData\\Local\\pypoetry\\Cache\\virtualenvs\\adv-bot-rDw-hi0a-py3.11\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.envFile": "${workspaceFolder}/.env",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "python.analysis.typeCheckingMode": "strict",
+    "python.analysis.diagnosticMode": "workspace",
+    "python.analysis.autoSearchPaths": true,
+    "python.analysis.useLibraryCodeForTypes": true,
+    "debugpy.debugJustMyCode": false,
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.mypy_cache": true,
+        "**/.pytest_cache": true
+    },
+
+
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": [
+        ".",
+        "-vv"
+    ],
+    "python.testing.autoTestDiscoverOnSaveEnabled": true,
+
+    "python.testing.cwd": "${workspaceFolder}",
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "cursorpyright.analysis.typeCheckingMode": "strict",
+    "cursorpyright.analysis.diagnosticMode": "workspace",
+    "cursorpyright.analysis.autoSearchPaths": true,
+    "cursorpyright.analysis.useLibraryCodeForTypes": true,
+    "todo-tree.tree.scanMode": "workspace only"
+}
